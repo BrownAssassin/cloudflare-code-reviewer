@@ -281,6 +281,28 @@ function unwrapGatewayResult(response: any): any {
   return response && typeof response === 'object' && 'result' in response ? response.result : response;
 }
 
+// The default AI Gateway has caching disabled until a request explicitly opts
+// in with a cache key. Hash the complete model input so only genuinely
+// identical requests share a response, while keeping source code and prompts
+// out of AI Gateway's cache-key metadata.
+async function runCachedAi(ai: any, model: string, input: unknown, gatewayOpts: any): Promise<any> {
+  if (!gatewayOpts) return ai.run(model, input);
+
+  const cacheMaterial = new TextEncoder().encode(JSON.stringify({ model, input }));
+  const digest = await crypto.subtle.digest('SHA-256', cacheMaterial);
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  const options = {
+    gateway: {
+      ...gatewayOpts.gateway,
+      skipCache: false,
+      cacheTtl: 86400,
+      cacheKey: `cloudflare-code-reviewer:v1:${fingerprint}`,
+    },
+  };
+
+  return ai.run(model, input, options);
+}
+
 const TRIAGE_CATEGORIES = {
   feature: 'New functionality',
   bugfix: 'Fixes broken behavior',
@@ -296,33 +318,30 @@ async function triageWithJev(
   diffHunk: string,
   gatewayOpts: any
 ): Promise<RawTriageAnswer> {
-  const response = await ai.run(
-    'typesafe/jev',
-    {
-      state: {
-        files_changed: reviewableFiles.map((f) => f.to || f.from || '').filter(Boolean),
-        diff_hunk: diffHunk.slice(0, 4000),
+  const input = {
+    state: {
+      files_changed: reviewableFiles.map((f) => f.to || f.from || '').filter(Boolean),
+      diff_hunk: diffHunk.slice(0, 4000),
+    },
+    questions: {
+      needs_security_review: {
+        type: 'noul',
+        instructions:
+          "Does this diff touch logic where a real security vulnerability (injection, auth bypass, unsafe deserialization, race condition, resource leak) is plausible? Answer no for docs-only, style-only, or test-fixture-only changes.",
       },
-      questions: {
-        needs_security_review: {
-          type: 'noul',
-          instructions:
-            "Does this diff touch logic where a real security vulnerability (injection, auth bypass, unsafe deserialization, race condition, resource leak) is plausible? Answer no for docs-only, style-only, or test-fixture-only changes.",
-        },
-        needs_quality_review: {
-          type: 'noul',
-          instructions:
-            'Would a human code reviewer likely have substantive style/correctness feedback on this diff, beyond nitpicks? Answer no for trivial or mechanical changes (dependency bumps, generated files, pure formatting).',
-        },
-        category: {
-          type: 'choice',
-          instructions: 'What kind of change is this?',
-          criteria: TRIAGE_CATEGORIES,
-        },
+      needs_quality_review: {
+        type: 'noul',
+        instructions:
+          'Would a human code reviewer likely have substantive style/correctness feedback on this diff, beyond nitpicks? Answer no for trivial or mechanical changes (dependency bumps, generated files, pure formatting).',
+      },
+      category: {
+        type: 'choice',
+        instructions: 'What kind of change is this?',
+        criteria: TRIAGE_CATEGORIES,
       },
     },
-    gatewayOpts
-  );
+  };
+  const response = await runCachedAi(ai, 'typesafe/jev', input, gatewayOpts);
 
   const result = unwrapGatewayResult(response);
 
@@ -350,26 +369,23 @@ async function triageWithFallbackModel(
   diffHunk: string,
   gatewayOpts: any
 ): Promise<RawTriageAnswer> {
-  const response = await ai.run(
-    '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-    {
-      messages: [
-        {
-          role: 'system',
-          content: `You are a fast triage classifier for a code review pipeline. Given a diff, decide two yes/no questions and a category. Respond with ONLY a JSON object, no prose, no markdown fences, in exactly this shape:
+  const input = {
+    messages: [
+      {
+        role: 'system',
+        content: `You are a fast triage classifier for a code review pipeline. Given a diff, decide two yes/no questions and a category. Respond with ONLY a JSON object, no prose, no markdown fences, in exactly this shape:
 {"needs_security_review": true|false, "needs_quality_review": true|false, "category": "feature"|"bugfix"|"refactor"|"docs_or_config"|"dependency_bump"|"test_only"}
 
 needs_security_review: true if the diff touches logic where a real security vulnerability (injection, auth bypass, unsafe deserialization, race condition, resource leak) is plausible. false for docs-only, style-only, or test-fixture-only changes.
 needs_quality_review: true if a human reviewer would likely have substantive style/correctness feedback beyond nitpicks. false for trivial/mechanical changes (dependency bumps, generated files, pure formatting).`,
-        },
-        {
-          role: 'user',
-          content: `Files changed: ${JSON.stringify(reviewableFiles.map((f) => f.to || f.from || '').filter(Boolean))}\n\nDiff:\n${diffHunk.slice(0, 4000)}`,
-        },
-      ],
-    },
-    gatewayOpts
-  );
+      },
+      {
+        role: 'user',
+        content: `Files changed: ${JSON.stringify(reviewableFiles.map((f) => f.to || f.from || '').filter(Boolean))}\n\nDiff:\n${diffHunk.slice(0, 4000)}`,
+      },
+    ],
+  };
+  const response = await runCachedAi(ai, '@cf/meta/llama-3.3-70b-instruct-fp8-fast', input, gatewayOpts);
 
   const result = unwrapGatewayResult(response);
   // Depending on routing, this comes back either as Workers AI's simple
@@ -598,11 +614,10 @@ export class PrReviewCoordinator extends DurableObject<Env> {
       console.error('resolveGitHubToken threw:', tokenErr?.message ?? tokenErr);
     }
 
-    // Every AI Gateway option below is what actually turns on the 24h cache,
-    // analytics, and fallback routing — without this 3rd argument,
-    // env.AI.run() calls Workers AI directly and none of that applies.
+    // Route model calls through AI Gateway. runCachedAi() adds a unique
+    // model-and-input cache key and a 24h TTL to each request.
     const gatewayOpts = this.env.AI_GATEWAY_NAME
-      ? { gateway: { id: this.env.AI_GATEWAY_NAME, cacheTtl: 86400 } }
+      ? { gateway: { id: this.env.AI_GATEWAY_NAME } }
       : undefined;
 
     try {
@@ -727,7 +742,7 @@ export class PrReviewCoordinator extends DurableObject<Env> {
       const [securityReport, codeReport] = await Promise.all([
         // Security Specialist: DeepSeek R1 does Mantis-style reachability reasoning
         triage.needsSecurity
-          ? this.env.AI.run('@cf/deepseek-ai/deepseek-r1-distill-qwen-32b', {
+          ? runCachedAi(this.env.AI, '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b', {
               messages: [
                 {
                   role: 'system',
@@ -746,7 +761,7 @@ If nothing is reachable and exploitable, respond with NONE.`
 
         // Code Quality Specialist: Alibaba Qwen 2.5 Coder (Clean Syntax & Fix Generation)
         triage.needsQuality
-          ? this.env.AI.run('@cf/qwen/qwen2.5-coder-32b-instruct', {
+          ? runCachedAi(this.env.AI, '@cf/qwen/qwen2.5-coder-32b-instruct', {
               messages: [
                 {
                   role: 'system',
@@ -766,7 +781,7 @@ For any issue found:
       ]);
 
       // ── PILLAR 6: OWASP-ASRH-style Regression Check + Lead Arbiter Synthesis ─
-      const finalSynthesis = await this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+      const finalSynthesis = await runCachedAi(this.env.AI, '@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
         messages: [
           {
             role: 'system',
