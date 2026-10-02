@@ -208,16 +208,16 @@ This is exactly what happened deploying the reference App against a real private
 
 ### 4. (Optional) Enable AI Gateway caching
 
-By default the agent calls Workers AI directly — no gateway, no caching. To turn on the 24h diff cache, fallback routing, and observability:
+By default the agent calls Workers AI directly — no gateway, no caching. To turn on the 24h diff cache and observability:
 
-1. Dashboard → **AI** → **AI Gateway** → **Create Gateway** (any name).
-2. Add it to that track's `wrangler.json` (`starter/wrangler.json` or the root one):
+1. Use `default` to let Cloudflare create a gateway automatically on the first authenticated request, or create a named gateway under Dashboard → **AI** → **AI Gateway**.
+2. Add the gateway ID to that track's `wrangler.json` (`starter/wrangler.json` or the root one):
    ```json
-   "vars": { "AI_GATEWAY_NAME": "your-gateway-name" }
+   "vars": { "AI_GATEWAY_NAME": "default" }
    ```
-3. Redeploy. Every `env.AI.run()` call already checks for `AI_GATEWAY_NAME` and routes through it automatically when present — no code changes needed.
+3. Redeploy. The Advanced Track hashes each model name and complete request body into a distinct cache key, explicitly opts that request into caching, and keeps the result for 24 hours. Identical retries are served from cache without putting source code or prompts in cache-key metadata.
 
-> This is opt-in on purpose: a gateway ID that doesn't exist yet returns an error, so shipping a hardcoded default would break the demo for anyone who skips this step.
+> A named gateway must exist before deployment. The special `default` gateway is the exception: Cloudflare creates it automatically on first use.
 
 ---
 
